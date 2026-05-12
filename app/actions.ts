@@ -4,8 +4,9 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import type { PresetKey, Runtime } from "@/types/app";
 import { createSession, createUser, destroySession, requireUser, verifyUser } from "@/utils/auth";
-import { deployAppContainer, deployPresetContainer, startContainer, stopContainer } from "@/utils/docker";
+import { startContainer, stopContainer } from "@/utils/docker";
 import { migrate, sql } from "@/utils/db";
+import { queueDeployment } from "@/utils/deployments";
 import { ensureSshKey } from "@/utils/ssh";
 import { domainFromSlug, optional, required, slugify } from "@/utils/strings";
 
@@ -95,41 +96,7 @@ export async function createApplicationAction(formData: FormData) {
 		returning *
 	`;
 
-	try {
-		for (const preset of presetKeys) {
-			const service = await deployPresetContainer(app.slug, preset);
-			await sql`
-				insert into services (application_id, preset, name, container_id, status, connection_url)
-				values (${app.id}, ${preset}, ${service.name}, ${service.id}, 'running', ${service.connectionUrl})
-			`;
-		}
-
-		const containerId = await deployAppContainer(app, [hostname]);
-
-		await sql`
-			update applications
-			set status = 'running', container_id = ${containerId}, updated_at = now(), last_error = null
-			where id = ${app.id}
-		`;
-		await sql`
-			update deployments
-			set status = 'running', container_id = ${containerId}, finished_at = now()
-			where id = ${deployment.id}
-		`;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "Deployment failed.";
-		await sql`
-			update applications
-			set status = 'failed', last_error = ${message}, updated_at = now()
-			where id = ${app.id}
-		`;
-		await sql`
-			update deployments
-			set status = 'failed', logs = ${message}, finished_at = now()
-			where id = ${deployment.id}
-		`;
-	}
-
+	queueDeployment(app.id, presetKeys, deployment.id);
 	revalidatePath("/dashboard");
 	redirect(`/apps/${app.id}`);
 }
@@ -155,7 +122,6 @@ export async function redeployAction(applicationId: string) {
 		throw new Error("Application not found.");
 	}
 
-	const domains = await sql<{ hostname: string }[]>`select hostname from domains where application_id = ${applicationId}`;
 	const [deployment] = await sql`
 		insert into deployments (application_id, status)
 		values (${applicationId}, 'building')
@@ -164,32 +130,7 @@ export async function redeployAction(applicationId: string) {
 
 	await sql`update applications set status = 'building', updated_at = now() where id = ${applicationId}`;
 
-	try {
-		const containerId = await deployAppContainer(app, domains.map((domain) => domain.hostname));
-		await sql`
-			update applications
-			set status = 'running', container_id = ${containerId}, updated_at = now(), last_error = null
-			where id = ${applicationId}
-		`;
-		await sql`
-			update deployments
-			set status = 'running', container_id = ${containerId}, finished_at = now()
-			where id = ${deployment.id}
-		`;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "Deployment failed.";
-		await sql`
-			update applications
-			set status = 'failed', last_error = ${message}, updated_at = now()
-			where id = ${applicationId}
-		`;
-		await sql`
-			update deployments
-			set status = 'failed', logs = ${message}, finished_at = now()
-			where id = ${deployment.id}
-		`;
-	}
-
+	queueDeployment(applicationId, [], deployment.id);
 	revalidatePath(`/apps/${applicationId}`);
 }
 
